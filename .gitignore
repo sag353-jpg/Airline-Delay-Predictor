@@ -1,0 +1,10 @@
+# Python
+__pycache__/
+.venv/
+
+# Downloaded weather cache (~21 MB, rebuilt by weather.py on first run)
+weather_2015.csv.gz
+
+# macOS / IDE
+.DS_Store
+.idea/workspace.xml

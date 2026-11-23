@@ -8,14 +8,10 @@ from sklearn.metrics import (
 
 # -- Visualize the data --
 
-def plot_results(pipe, X_test, y_test):
-
-
-    ConfusionMatrixDisplay.from_estimator(pipe, X_test, y_test, normalize="true")
-    RocCurveDisplay.from_estimator(pipe, X_test, y_test)
-    PrecisionRecallDisplay.from_estimator(pipe, X_test, y_test)
+def plot_results(y_test, preds, probs):
+    # preds use the chosen threshold, so the confusion matrix matches the printed report
+    ConfusionMatrixDisplay.from_predictions(
+        y_test, preds, normalize="true", display_labels=["on time", "delayed"])
+    RocCurveDisplay.from_predictions(y_test, probs)
+    PrecisionRecallDisplay.from_predictions(y_test, probs)
     plt.show()
-    classification_report(y_test, pipe.predict(X_test))
-
-
-

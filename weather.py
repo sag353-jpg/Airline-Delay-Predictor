@@ -1,5 +1,10 @@
+import http.client
+import json
 import os
-from datetime import datetime
+import sys
+import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 import certifi
@@ -8,116 +13,154 @@ import pandas as pd
 # This Python install has no CA certificates of its own, so HTTPS downloads fail without this
 os.environ.setdefault("SSL_CERT_FILE", certifi.where())
 
-import meteostat as ms  # noqa: E402  (must come after the certificate fix)
+# -- Weather (Open-Meteo) --
+#
+# Training uses Open-Meteo's archive of past *forecasts*, and the app uses its live forecast.
+# Same source, same variables, so the model sees the same kind of numbers in both places.
+# Times come back in each airport's local time, matching the BTS schedule times.
 
-# -- Historical weather (Meteostat / NOAA stations) --
+DATA_DIR = Path(__file__).parent / "data"
+WEATHER_DIR = DATA_DIR / "weather"
 
-CACHE_PATH = Path(__file__).parent / "weather_2015.csv.gz"
+HISTORY_URL = "https://historical-forecast-api.open-meteo.com/v1/forecast"
+FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
+HISTORY_START, HISTORY_END = "2023-01-01", "2025-12-31"
 
-# Hourly readings we keep. Others (snow, gusts, visibility) are almost always empty for 2015.
-PARAMETERS = {
-    ms.Parameter.TEMP: "TEMP",   # air temperature, deg C
-    ms.Parameter.RHUM: "RHUM",   # relative humidity, %
-    ms.Parameter.PRCP: "PRCP",   # precipitation in that hour, mm
-    ms.Parameter.WSPD: "WSPD",   # wind speed, km/h
-    ms.Parameter.PRES: "PRES",   # sea-level pressure, hPa (drops ahead of storms)
-    ms.Parameter.CLDC: "CLDC",   # cloud cover, oktas 0-8
+VARIABLES = {
+    "temperature_2m": "TEMP",          # deg C
+    "cape": "CAPE",                    # J/kg, thunderstorm energy (the forecast archive has
+                                       # no thunderstorm weather codes, so this stands in)
+    "precipitation": "PRCP",           # mm in that hour (rain + snow water)
+    "snowfall": "SNOW",                # cm in that hour
+    "wind_speed_10m": "WSPD",          # km/h
+    "wind_gusts_10m": "GUST",          # km/h
+    "cloud_cover": "CLDC",             # %
+    "pressure_msl": "PRES",            # hPa (drops ahead of storms)
+    "visibility": "VSBY",              # m
+    "weather_code": "WCODE",           # WMO code: 0 clear ... 45 fog, 6x rain, 7x snow, 8x showers
 }
+HOURLY_COLS = list(VARIABLES.values())
+DAILY_COLS = ["DAY_PRCP", "DAY_SNOW"]  # totals for the whole day (storms earlier cause knock-on delays)
+WEATHER_FEATURES = [p + c for p in ("ORIGIN_", "DEST_") for c in HOURLY_COLS + DAILY_COLS]
 
-# Data is in UTC, so pad the range to cover all of 2015 in every US timezone
-START, END = datetime(2015, 1, 1), datetime(2016, 1, 2)
+# Free tier: ~10,000 "calls" per day and 5,000 per hour. Three years of hourly data for one
+# airport counts as ~78 calls, so pace downloads to stay under the hourly limit.
+SECONDS_PER_AIRPORT = 65
 
-# airports.csv is missing coordinates for these three
-MISSING_COORDS = {
-    "ECP": (30.3577, -85.7956),  # Panama City, FL
-    "PBG": (44.6509, -73.4681),  # Plattsburgh, NY
-    "UST": (29.9592, -81.3398),  # St. Augustine, FL
-}
-
-
-def load_weather(airports):
-    """Hourly weather per airport in local time: IATA_CODE, TIME, TEMP, RHUM, ...
-
-    Downloads once (a few minutes) and then reads from the local cache.
-    """
-    if CACHE_PATH.exists():
-        return pd.read_csv(CACHE_PATH, parse_dates=["TIME"])
-
-    airports = airports.copy()
-    for code, (lat, lon) in MISSING_COORDS.items():
-        airports.loc[airports["IATA_CODE"] == code, ["LATITUDE", "LONGITUDE"]] = lat, lon
-
-    frames = []
-    for i, row in enumerate(airports.itertuples(), 1):
-        print(f"Weather {i}/{len(airports)}: {row.IATA_CODE}", end="\r")
-        frame = fetch_airport_weather(row.LATITUDE, row.LONGITUDE)
-        if frame is not None:
-            frame.insert(0, "IATA_CODE", row.IATA_CODE)
-            frames.append(frame)
-    print()
-
-    weather = pd.concat(frames, ignore_index=True)
-    weather.to_csv(CACHE_PATH, index=False)
-    return weather
+# OurAirports is missing the IATA code for this one
+MISSING_COORDS = {"PBI": (26.6832, -80.0956)}
 
 
-def fetch_airport_weather(lat, lon):
-    stations = ms.stations.nearby(ms.Point(lat, lon), radius=50_000, limit=5)
-    if stations.empty:
-        return None
+def airport_coords():
+    """IATA_CODE, LATITUDE, LONGITUDE for every airport with an IATA code."""
+    a = pd.read_csv(DATA_DIR / "ourairports.csv", usecols=["iata_code", "latitude_deg", "longitude_deg"])
+    a = a.dropna(subset=["iata_code"]).drop_duplicates("iata_code")
+    a.columns = ["LATITUDE", "LONGITUDE", "IATA_CODE"]
+    extra = pd.DataFrame([(c, lat, lon) for c, (lat, lon) in MISSING_COORDS.items()],
+                         columns=["IATA_CODE", "LATITUDE", "LONGITUDE"])
+    return pd.concat([a[["IATA_CODE", "LATITUDE", "LONGITUDE"]], extra], ignore_index=True)
 
-    raw = ms.hourly(list(stations.index), START, END, parameters=list(PARAMETERS)).fetch()
-    if raw is None or raw.empty:
-        return None
-    raw = raw.rename(columns={p.value: name for p, name in PARAMETERS.items()}).astype(float)
 
-    # Hour by hour, use the closest station that actually has a reading
-    available = raw.index.get_level_values("station")
-    hourly = None
-    for station_id in stations.index:  # already sorted nearest first
-        if station_id in available:
-            readings = raw.xs(station_id, level="station")
-            hourly = readings if hourly is None else hourly.combine_first(readings)
-
-    # Flight times are local, so convert UTC to the airport's local time
-    timezone = stations["timezone"].iloc[0]
-    local = hourly.index.tz_localize("UTC").tz_convert(timezone).tz_localize(None)
-    hourly = hourly.set_axis(local).rename_axis("TIME").reset_index()
-
-    # The repeated hour when DST ends shows up twice locally; keep the first
+def _fetch(url, lat, lon, extra_params):
+    params = (f"?latitude={lat}&longitude={lon}&hourly={','.join(VARIABLES)}"
+              f"&timezone=auto&{extra_params}")
+    with urllib.request.urlopen(url + params, timeout=180) as response:
+        hourly = pd.DataFrame(json.load(response)["hourly"])
+    hourly = hourly.rename(columns={"time": "TIME", **VARIABLES})
+    hourly["TIME"] = pd.to_datetime(hourly["TIME"])
+    # When DST ends, the repeated local hour shows up twice; keep the first
     return hourly.drop_duplicates("TIME")
 
 
-def add_weather_features(flights, airports, dates):
-    """Weather at the origin at departure and at the destination at arrival."""
-    weather = load_weather(airports)
-    weather_cols = list(PARAMETERS.values())
+def fetch_forecast(lat, lon):
+    """Hourly forecast for the next 16 days in local time (used by the app)."""
+    return _fetch(FORECAST_URL, lat, lon, "forecast_days=16")
 
-    # Total precipitation that day: storms earlier in the day cause knock-on delays
-    weather["DATE"] = weather["TIME"].dt.normalize()
-    weather["DAY_PRCP"] = weather.groupby(["IATA_CODE", "DATE"])["PRCP"].transform("sum", min_count=1)
-    weather = weather.drop(columns="DATE")
-    weather_cols.append("DAY_PRCP")
+
+def download_history(codes):
+    """Download history for each airport code not already cached. Stops at the daily limit.
+
+    Safe to re-run: airports already in data/weather/ are skipped.
+    """
+    WEATHER_DIR.mkdir(parents=True, exist_ok=True)
+    coords = airport_coords().set_index("IATA_CODE")
+    todo = [c for c in codes if not (WEATHER_DIR / f"{c}.csv.gz").exists()]
+    print(f"{len(codes) - len(todo)} airports cached, {len(todo)} to download", flush=True)
+
+    for i, code in enumerate(todo, 1):
+        if code not in coords.index:
+            print(f"  {code}: no coordinates, skipping", flush=True)
+            continue
+        started = time.time()
+        lat, lon = coords.loc[code, ["LATITUDE", "LONGITUDE"]]
+        hourly = None
+        for attempt in range(4):
+            try:
+                hourly = _fetch(HISTORY_URL, lat, lon, f"start_date={HISTORY_START}&end_date={HISTORY_END}")
+                break
+            except urllib.error.HTTPError as e:
+                if e.code == 429:
+                    print(f"Rate limit reached after {i - 1} airports. Run again later to continue.", flush=True)
+                    return
+                error = e
+            except (TimeoutError, urllib.error.URLError, ConnectionError, http.client.HTTPException) as e:
+                error = e
+            time.sleep(30 * (attempt + 1))  # slow or flaky response: wait longer each time
+        if hourly is None:
+            print(f"  {code}: failed 4 times ({error}), skipping for now", flush=True)
+            continue
+        hourly.to_csv(WEATHER_DIR / f"{code}.csv.gz", index=False)
+        print(f"  [{i}/{len(todo)}] {code}", flush=True)
+        if i < len(todo):
+            time.sleep(max(0, SECONDS_PER_AIRPORT - (time.time() - started)))
+    print("All airports downloaded.", flush=True)
+
+
+def load_weather_history():
+    """All cached airport weather: IATA_CODE, TIME, TEMP, RHUM, ..."""
+    frames = [pd.read_csv(path, parse_dates=["TIME"]).assign(IATA_CODE=path.name.split(".")[0])
+              for path in sorted(WEATHER_DIR.glob("*.csv.gz"))]
+    return pd.concat(frames, ignore_index=True)
+
+
+def add_daily_totals(weather):
+    date = weather["TIME"].dt.normalize()
+    for hourly_col, daily_col in [("PRCP", "DAY_PRCP"), ("SNOW", "DAY_SNOW")]:
+        weather[daily_col] = weather.groupby(["IATA_CODE", date])[hourly_col].transform("sum")
+    return weather
+
+
+def add_weather_features(flights, weather, dates):
+    """Weather at the origin at departure and at the destination at arrival.
+
+    flights needs ORIGIN_AIRPORT, DESTINATION_AIRPORT, SCHEDULED_DEPARTURE and
+    SCHEDULED_ARRIVAL (HHMM, local). dates = each flight's date. weather = output of
+    load_weather_history() or a forecast with IATA_CODE added. Airports with no weather get NaN.
+    """
+    weather = add_daily_totals(weather.copy())
+    cols = HOURLY_COLS + DAILY_COLS
 
     # Scheduled departure hour (local, origin). Hour 24 rolls over into the next day.
     dep_time = dates + pd.to_timedelta(flights["SCHEDULED_DEPARTURE"] // 100, unit="h")
-
     # Scheduled arrival hour (local, destination). Arrival before departure = overnight flight.
     overnight = flights["SCHEDULED_ARRIVAL"] < flights["SCHEDULED_DEPARTURE"]
     arr_time = (dates + pd.to_timedelta(overnight.astype(int), unit="D")
                 + pd.to_timedelta(flights["SCHEDULED_ARRIVAL"] // 100, unit="h"))
 
-    for prefix, airport_col, when in [("ORIGIN_", "IATA_CODE", dep_time),
+    for prefix, airport_col, when in [("ORIGIN_", "ORIGIN_AIRPORT", dep_time),
                                       ("DEST_", "DESTINATION_AIRPORT", arr_time)]:
-        lookup = weather.rename(columns={"IATA_CODE": airport_col, "TIME": "_TIME"})
-        lookup = lookup.rename(columns={c: prefix + c for c in weather_cols})
-        keys = flights[[airport_col]].assign(_TIME=when.values)
-        matched = keys.merge(lookup, on=[airport_col, "_TIME"], how="left")
-        for c in weather_cols:
-            flights[prefix + c] = matched[prefix + c].values
-
+        lookup = weather.rename(columns={"IATA_CODE": airport_col, "TIME": "_TIME",
+                                         **{c: prefix + c for c in cols}})
+        keys = pd.DataFrame({airport_col: flights[airport_col].to_numpy(), "_TIME": when.to_numpy()})
+        matched = keys.merge(lookup[[airport_col, "_TIME"] + [prefix + c for c in cols]],
+                             on=[airport_col, "_TIME"], how="left")
+        for c in cols:
+            flights[prefix + c] = matched[prefix + c].to_numpy()
     return flights
 
 
-WEATHER_FEATURES = [p + c for p in ("ORIGIN_", "DEST_")
-                    for c in list(PARAMETERS.values()) + ["DAY_PRCP"]]
+if __name__ == "__main__":
+    # python weather.py  -> download history for all airports, busiest first
+    traffic = pd.read_csv(DATA_DIR / "airport_traffic.csv")
+    limit = int(sys.argv[1]) if len(sys.argv) > 1 else None
+    download_history(traffic["IATA_CODE"].tolist()[:limit])

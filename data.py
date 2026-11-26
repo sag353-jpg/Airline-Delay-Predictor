@@ -1,49 +1,62 @@
-import kagglehub
+import zipfile
+from pathlib import Path
+
 import pandas as pd
-import os
 
 # -- Read in the data --
+#
+# Flights: BTS "Reporting Carrier On-Time Performance" monthly files, 2023-2025
+# (https://www.transtats.bts.gov). Downloaded as zips into data/bts/.
+# The first load combines them into one parquet file, which later loads take seconds to read.
 
-def load_data():
-    path = kagglehub.dataset_download("usdot/flight-delays")
+DATA_DIR = Path(__file__).parent / "data"
+BTS_DIR = DATA_DIR / "bts"
+FLIGHTS_CACHE = DATA_DIR / "flights_2023_2025.parquet"
 
-    # Access each individual csv in usdot/flights-delays
-    flights_path = os.path.join(path, "flights.csv")
-    airports_path = os.path.join(path, "airports.csv")
-    airlines_path = os.path.join(path, "airlines.csv")
+# BTS column -> name used throughout this project
+COLUMNS = {
+    "FlightDate": "FLIGHT_DATE",
+    "Year": "YEAR",
+    "Month": "MONTH",
+    "DayofMonth": "DAY",
+    "DayOfWeek": "DAY_OF_WEEK",          # 1 = Monday
+    "Reporting_Airline": "AIRLINE",
+    "Flight_Number_Reporting_Airline": "FLIGHT_NUMBER",
+    "Tail_Number": "TAIL_NUMBER",
+    "Origin": "ORIGIN_AIRPORT",
+    "Dest": "DESTINATION_AIRPORT",
+    "CRSDepTime": "SCHEDULED_DEPARTURE",  # HHMM, local time
+    "CRSArrTime": "SCHEDULED_ARRIVAL",    # HHMM, local time
+    "CRSElapsedTime": "SCHEDULED_TIME",
+    "Distance": "DISTANCE",
+    "DepDelay": "DEPARTURE_DELAY",
+    "ArrDelay": "ARRIVAL_DELAY",
+    "Cancelled": "CANCELLED",
+    "Diverted": "DIVERTED",
+}
+# Not loaded on purpose: delay-cause columns (CarrierDelay, WeatherDelay, ...) and actual
+# times. They're only known after the flight, so they would leak the answer.
 
-    # Assign each csv a dataframe. nrows for testing.
-    flights = pd.read_csv(flights_path, dtype={"ORIGIN_AIRPORT": str, "DESTINATION_AIRPORT": str})
-    airports = pd.read_csv(airports_path)
-    flights = flights.drop(columns=["CANCELLATION_REASON", "AIR_SYSTEM_DELAY", "SECURITY_DELAY","AIRLINE_DELAY","LATE_AIRCRAFT_DELAY","WEATHER_DELAY"])
-    flights = fix_october_airports(flights)
-    return flights, airports
+
+def load_flights():
+    if not FLIGHTS_CACHE.exists():
+        build_flights_cache()
+    return pd.read_parquet(FLIGHTS_CACHE)
 
 
-def fix_october_airports(flights):
-    """October 2015 uses numeric BTS airport IDs (e.g. 10397) instead of IATA codes (ATL).
-
-    Recover the codes from the data: the same airline + flight number + scheduled time
-    almost always flies the same route in September and November, so each numeric ID
-    gets the IATA code it lines up with most often.
-    """
-    key = ["AIRLINE", "FLIGHT_NUMBER", "SCHEDULED_DEPARTURE"]
-    october = flights.loc[flights["MONTH"] == 10, key + ["ORIGIN_AIRPORT", "DESTINATION_AIRPORT"]]
-    reference = (flights.loc[flights["MONTH"].isin([9, 11]), key + ["ORIGIN_AIRPORT", "DESTINATION_AIRPORT"]]
-                 .drop_duplicates())
-    matched = october.merge(reference, on=key, suffixes=("", "_IATA"))
-
-    votes = pd.concat([
-        matched[["ORIGIN_AIRPORT", "ORIGIN_AIRPORT_IATA"]].set_axis(["ID", "IATA"], axis=1),
-        matched[["DESTINATION_AIRPORT", "DESTINATION_AIRPORT_IATA"]].set_axis(["ID", "IATA"], axis=1),
-    ])
-    counts = votes.value_counts().rename("n").reset_index()
-    best = counts.sort_values("n", ascending=False).drop_duplicates("ID")
-    agreement = best["n"] / best["ID"].map(counts.groupby("ID")["n"].sum())
-    best = best[agreement >= 0.8]  # only trust clear winners (in practice ~99% agree)
-    id_to_iata = dict(zip(best["ID"], best["IATA"]))
-
-    for col in ["ORIGIN_AIRPORT", "DESTINATION_AIRPORT"]:
-        flights[col] = flights[col].replace(id_to_iata)
-    # The handful of IDs that couldn't be mapped stay numeric and get dropped by the airport merge
-    return flights
+def build_flights_cache():
+    months = []
+    for path in sorted(BTS_DIR.glob("ontime_*.zip")):
+        print(f"Reading {path.name}", end="\r", flush=True)
+        with zipfile.ZipFile(path) as z:
+            csv_name = next(n for n in z.namelist() if n.endswith(".csv"))
+            month = pd.read_csv(z.open(csv_name), usecols=list(COLUMNS),
+                                dtype={"Tail_Number": str, "Origin": str, "Dest": str})
+        months.append(month.rename(columns=COLUMNS))
+    print()
+    flights = pd.concat(months, ignore_index=True)
+    flights["FLIGHT_DATE"] = pd.to_datetime(flights["FLIGHT_DATE"])
+    for col in ["AIRLINE", "ORIGIN_AIRPORT", "DESTINATION_AIRPORT", "TAIL_NUMBER"]:
+        flights[col] = flights[col].astype("string")
+    flights.to_parquet(FLIGHTS_CACHE, index=False)
+    print(f"Saved {len(flights):,} flights to {FLIGHTS_CACHE.name}")

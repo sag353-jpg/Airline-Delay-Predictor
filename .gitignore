@@ -8,3 +8,9 @@ weather_2015.csv.gz
 # macOS / IDE
 .DS_Store
 .idea/workspace.xml
+
+# Downloaded BTS flight data (~1 GB)
+data/
+
+# Trained models and lookup tables (rebuilt by train.py / predict.py build)
+models/

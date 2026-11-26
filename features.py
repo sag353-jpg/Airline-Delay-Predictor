@@ -1,56 +1,36 @@
 import numpy as np
 import pandas as pd
 
-from data import load_data
-from weather import add_weather_features
+from data import load_flights
+from weather import add_weather_features, load_weather_history
 
 # -- Feature Engineering --
 
+FIRST_DAY = pd.Timestamp("2023-01-01")  # day 0 for absolute day/minute counters
+
+
 def prepare_features():
-    flights, airports = load_data()
-
-    # Convert AIRLINE into integer keys
-
-    airline_ids = {
-        "UA": 0,
-        "AA": 1,
-        "US": 2,
-        "F9": 3,
-        "B6": 4,
-        "OO": 5,
-        "AS": 6,
-        "NK": 7,
-        "WN": 8,
-        "DL": 9,
-        "EV": 10,
-        "HA": 11,
-        "MQ": 12,
-        "VX": 13,
-    }
-
-    flights["AIRLINE"] = flights["AIRLINE"].map(airline_ids)
-
-    # Attach airport info (coordinates for weather). Inner join also drops the few
-    # October airport IDs that couldn't be mapped to a code.
-    flights = flights.rename(columns={"ORIGIN_AIRPORT": "IATA_CODE"})
-    flights = flights.merge(airports, on = "IATA_CODE")
+    flights = load_flights()
 
     # Scheduled times are stored as HHMM (e.g. 1359), so 1259 -> 1300 looks like a jump of 41.
     # Convert to hour of day and minutes since midnight.
     flights["DEP_HOUR"] = flights["SCHEDULED_DEPARTURE"] // 100
     flights["DEP_MINUTES"] = hhmm_to_minutes(flights["SCHEDULED_DEPARTURE"])
+    flights["ARR_MINUTES"] = hhmm_to_minutes(flights["SCHEDULED_ARRIVAL"])
+    # Days since FIRST_DAY: a single counter for dates across all years
+    flights["DAY_INDEX"] = (flights["FLIGHT_DATE"] - FIRST_DAY).dt.days
 
     # -- Aircraft rotation features --
     # Order each plane's flights within a day so we can look at its previous leg
-    flights = flights.sort_values(["TAIL_NUMBER", "MONTH", "DAY", "SCHEDULED_DEPARTURE"])
-    by_plane_day = flights.groupby(["TAIL_NUMBER", "MONTH", "DAY"])
+    flights = flights.sort_values(["TAIL_NUMBER", "FLIGHT_DATE", "SCHEDULED_DEPARTURE"]).reset_index(drop=True)
+    by_plane_day = flights.groupby(["TAIL_NUMBER", "FLIGHT_DATE"])
 
     # How many flights this plane has already flown today (0 = first flight of the day)
     flights["LEG_OF_DAY"] = by_plane_day.cumcount()
 
     # Minutes between the previous leg's scheduled arrival and this scheduled departure.
     # First leg of the day has no previous flight, so give it a full day (1440) of buffer.
-    prev_sched_arrival = hhmm_to_minutes(by_plane_day["SCHEDULED_ARRIVAL"].shift())
+    prev_sched_arrival = by_plane_day["ARR_MINUTES"].shift()
     flights["TURNAROUND_MIN"] = (flights["DEP_MINUTES"] - prev_sched_arrival).fillna(1440)
 
     # Previous leg's actual arrival delay. Only valid if predicting AFTER that leg lands
@@ -70,33 +50,30 @@ def prepare_features():
     # it arrived. Small or negative = the late arrival will push this departure late too.
     flights["INBOUND_SLACK"] = flights["TURNAROUND_MIN"] - flights["PREV_ARRIVAL_DELAY"]
 
-    # -- Calendar features --
-    dates = pd.to_datetime(flights[["YEAR", "MONTH", "DAY"]])
-    flights["DAY_OF_YEAR"] = dates.dt.dayofyear
+    # Flights with no tail number can't be linked to a previous leg
+    no_tail = flights["TAIL_NUMBER"].isna()
+    flights.loc[no_tail, ROTATION_FEATURES] = np.nan
 
-    # Days to the nearest major travel holiday (computed once per unique date, then mapped)
-    unique_dates = pd.Series(dates.unique())
-    holidays = pd.to_datetime(MAJOR_HOLIDAYS)
-    days_away = unique_dates.apply(lambda d: abs((holidays - d).days).min())
-    flights["DAYS_TO_HOLIDAY"] = dates.map(dict(zip(unique_dates, days_away)))
+    # -- Calendar features --
+    flights["DAYS_TO_HOLIDAY"] = days_to_holiday(flights["FLIGHT_DATE"])
 
     # -- Schedule padding --
     # Airlines pad the schedule on routes they know run late. Compare this flight's
     # scheduled duration to the typical one for its route (positive = extra padding).
-    route = ["IATA_CODE", "DESTINATION_AIRPORT"]
+    route = ["ORIGIN_AIRPORT", "DESTINATION_AIRPORT"]
     route_median = flights.groupby(route)["SCHEDULED_TIME"].transform("median")
     flights["SCHEDULE_PADDING"] = flights["SCHEDULED_TIME"] - route_median
 
     # -- Airport congestion --
     # Counted from the schedule (cancelled flights included), so it is known in advance.
     # Scheduled departures from the origin in the same hour, and across the whole day
-    dep_hour = ["IATA_CODE", "DAY_OF_YEAR", "DEP_HOUR"]
+    dep_hour = ["ORIGIN_AIRPORT", "DAY_INDEX", "DEP_HOUR"]
     flights["ORIGIN_HOUR_DEPS"] = flights.groupby(dep_hour)["FLIGHT_NUMBER"].transform("size")
-    flights["ORIGIN_DAY_DEPS"] = flights.groupby(["IATA_CODE", "DAY_OF_YEAR"])["FLIGHT_NUMBER"].transform("size")
+    flights["ORIGIN_DAY_DEPS"] = flights.groupby(["ORIGIN_AIRPORT", "DAY_INDEX"])["FLIGHT_NUMBER"].transform("size")
 
     # Scheduled arrivals into the destination in the same hour (overnight flights land the next day)
     overnight = (flights["SCHEDULED_ARRIVAL"] < flights["SCHEDULED_DEPARTURE"]).astype(int)
-    flights["_ARR_DAY"] = flights["DAY_OF_YEAR"] + overnight
+    flights["_ARR_DAY"] = flights["DAY_INDEX"] + overnight
     flights["_ARR_HOUR"] = flights["SCHEDULED_ARRIVAL"] // 100
     arr_hour = ["DESTINATION_AIRPORT", "_ARR_DAY", "_ARR_HOUR"]
     flights["DEST_HOUR_ARRS"] = flights.groupby(arr_hour)["FLIGHT_NUMBER"].transform("size")
@@ -106,52 +83,68 @@ def prepare_features():
     # Catches ground stops, air traffic slowdowns, and staffing problems that weather misses.
     # Only flights that left/landed between 3h and 1h before this flight's scheduled departure,
     # so everything here is known 1 hour ahead (RECENT_WINDOW_START/END).
-    # Times are minutes since Jan 1 so windows can cross midnight.
-    sched_dep = (flights["DAY_OF_YEAR"] - 1) * 1440 + flights["DEP_MINUTES"]
-    sched_arr = ((flights["DAY_OF_YEAR"] - 1 + overnight) * 1440
-                 + hhmm_to_minutes(flights["SCHEDULED_ARRIVAL"]))
+    # Times are minutes since FIRST_DAY so windows can cross midnight.
+    sched_dep = flights["DAY_INDEX"] * 1440 + flights["DEP_MINUTES"]
+    sched_arr = (flights["DAY_INDEX"] + overnight) * 1440 + flights["ARR_MINUTES"]
     actual_dep = sched_dep + flights["DEPARTURE_DELAY"]  # NaN if cancelled -> ignored
     actual_arr = sched_arr + flights["ARRIVAL_DELAY"]
 
     flights["ORIGIN_RECENT_DEP_DELAY"], flights["ORIGIN_RECENT_DEPS"] = recent_average(
-        flights["IATA_CODE"], actual_dep, flights["DEPARTURE_DELAY"],
-        flights["IATA_CODE"], sched_dep)
+        flights["ORIGIN_AIRPORT"], actual_dep, flights["DEPARTURE_DELAY"],
+        flights["ORIGIN_AIRPORT"], sched_dep)
     flights["DEST_RECENT_ARR_DELAY"], _ = recent_average(
         flights["DESTINATION_AIRPORT"], actual_arr, flights["ARRIVAL_DELAY"],
         flights["DESTINATION_AIRPORT"], sched_dep)
 
     # -- Weather at origin (departure hour) and destination (arrival hour) --
-    flights = add_weather_features(flights, airports, dates)
+    flights = add_weather_features(flights, load_weather_history(), flights["FLIGHT_DATE"])
 
     # -- Categorical features --
     # Mark these as categories so XGBoost treats them as labels, not numbers
-    # (otherwise airline 8 counts as "bigger" than airline 3, which means nothing)
-    flights["ORIGIN"] = flights["IATA_CODE"].astype("category")
+    flights["ORIGIN"] = flights["ORIGIN_AIRPORT"].astype("category")
     flights["DEST"] = flights["DESTINATION_AIRPORT"].astype("category")
-    # (.map() above leaves float IDs; XGBoost needs integer or string categories)
-    flights["AIRLINE"] = flights["AIRLINE"].astype("Int64").astype("category")
+    flights["AIRLINE"] = flights["AIRLINE"].astype("category")
+
+    # 21M rows: store numbers as 32-bit to halve memory (plenty of precision for these values)
+    for col in flights.select_dtypes("float64").columns:
+        flights[col] = flights[col].astype("float32")
+    for col in flights.select_dtypes("int64").columns:
+        flights[col] = flights[col].astype("int32")
 
     return flights
 
 
-# Major US travel holidays around the 2015 data (includes New Year's 2016 for late December)
-MAJOR_HOLIDAYS = [
-    "2015-01-01",  # New Year's Day
-    "2015-05-25",  # Memorial Day
-    "2015-07-04",  # Independence Day
-    "2015-09-07",  # Labor Day
-    "2015-11-26",  # Thanksgiving
-    "2015-12-25",  # Christmas
-    "2016-01-01",  # New Year's Day
-]
-
+# Features that need the plane's tail number (only assigned close to the day of travel)
+ROTATION_FEATURES = ["LEG_OF_DAY", "TURNAROUND_MIN", "PREV_ARRIVAL_DELAY", "PREV_DEPARTURE_DELAY",
+                     "PREV_DISRUPTED", "INBOUND_SLACK"]
 
 RECENT_WINDOW_START = 180  # minutes before scheduled departure
 RECENT_WINDOW_END = 60     # = how far ahead the prediction is made
 
-# Features that can legitimately be missing (XGBoost handles NaN), so train.py keeps those rows.
-# Recent-delay averages are NaN when nothing left/landed at that airport in the window.
-NULLABLE_FEATURES = ["ORIGIN_RECENT_DEP_DELAY", "DEST_RECENT_ARR_DELAY"]
+
+def major_holidays(years):
+    """Major US travel holidays for the given years."""
+    days = []
+    for y in years:
+        nov = pd.date_range(f"{y}-11-01", f"{y}-11-30", freq="W-THU")
+        days += [
+            pd.Timestamp(f"{y}-01-01"),                                        # New Year's Day
+            pd.date_range(f"{y}-05-01", f"{y}-05-31", freq="W-MON")[-1],       # Memorial Day
+            pd.Timestamp(f"{y}-07-04"),                                        # Independence Day
+            pd.date_range(f"{y}-09-01", f"{y}-09-30", freq="W-MON")[0],        # Labor Day
+            nov[3],                                                            # Thanksgiving
+            pd.Timestamp(f"{y}-12-25"),                                        # Christmas
+        ]
+    return pd.DatetimeIndex(days)
+
+
+def days_to_holiday(dates):
+    """Days to the nearest major holiday (computed once per unique date, then mapped)."""
+    unique_dates = pd.Series(pd.to_datetime(dates).unique())
+    years = range(unique_dates.dt.year.min() - 1, unique_dates.dt.year.max() + 2)
+    holidays = major_holidays(years).values
+    days_away = unique_dates.apply(lambda d: np.abs((holidays - d.to_datetime64()) / np.timedelta64(1, "D")).min())
+    return pd.to_datetime(dates).map(dict(zip(unique_dates, days_away)))
 
 
 def recent_average(event_airport, event_time, event_value, query_airport, query_time):
